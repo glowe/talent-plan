@@ -16,6 +16,8 @@ use std::io;
 use std::io::prelude::*;
 use std::io::BufReader;
 use std::io::BufWriter;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::path::PathBuf;
 use std::result;
 
@@ -61,7 +63,7 @@ impl From<io::Error> for KvStoreError {
 pub struct KvStore {
     reader: BufReader<File>,
     writer: BufWriter<File>,
-    map: HashMap<String, String>,
+    index: HashMap<String, u64>,
 }
 
 pub type Result<T> = result::Result<T, KvStoreError>;
@@ -80,22 +82,25 @@ impl KvStore {
             fs::create_dir_all(&path)?;
         }
         path.push("kvs.log");
-        let wfile = File::options()
+
+        let mut wfile = File::options()
             .write(true)
             .append(true)
             .create(true)
             .open(&path)?;
+
         let rfile = File::open(&path)?;
         let mut reader = BufReader::new(rfile);
         let mut des = Deserializer::new(&mut reader);
-        let mut map = HashMap::new();
+        let mut index = HashMap::new();
+        let mut pos = 0;
         loop {
             match Command::deserialize(&mut des) {
-                Ok(Command::Set(key, value)) => {
-                    map.insert(key, value);
+                Ok(Command::Set(key, _)) => {
+                    index.insert(key, pos);
                 }
                 Ok(Command::Remove(key)) => {
-                    map.remove(&key);
+                    index.remove(&key);
                 }
                 Err(decode::Error::InvalidMarkerRead(err)) => match err.kind() {
                     std::io::ErrorKind::UnexpectedEof => {
@@ -105,13 +110,15 @@ impl KvStore {
                 },
                 Err(err) => return Err(KvStoreError::DecodeError(err.to_string())),
             }
+            pos = des.get_mut().stream_position()?;
         }
 
+        wfile.seek(SeekFrom::End(0))?;
         let writer = BufWriter::new(wfile);
         Ok(Self {
             reader,
             writer,
-            map,
+            index,
         })
     }
 
@@ -126,13 +133,15 @@ impl KvStore {
         If it fails, it exits by printing the error and returning a non-zero error code
         */
         let cmd = Command::Set(key.clone(), value.clone());
+        let pos = self.writer.stream_position()?;
         cmd.serialize(&mut Serializer::new(&mut self.writer))?;
-        self.map.insert(key, value);
+        self.index.insert(key, pos);
+        self.writer.flush()?;
         Ok(())
     }
 
     /// Get the string value of a string key. If the key does not exist, return None. Return an error if the value is not read successfully.
-    pub fn get(&self, key: String) -> Result<Option<String>> {
+    pub fn get(&mut self, key: String) -> Result<Option<String>> {
         /*
         The user invokes kvs get mykey
         kvs reads the entire log, one command at a time, recording the affected key and file offset of the command to an in-memory key -> log pointer map
@@ -142,7 +151,21 @@ impl KvStore {
         It deserializes the command to get the last recorded value of the key
         It prints the value to stdout and exits with exit code 0
         */
-        Ok(self.map.get(&key).map(|s| s.to_string()))
+        if let Some(pos) = self.index.get(&key) {
+            self.reader.seek(SeekFrom::Start(*pos))?;
+
+            let mut des = Deserializer::new(&mut self.reader);
+            match Command::deserialize(&mut des) {
+                Ok(Command::Set(_, value)) => Ok(Some(value)),
+                Ok(Command::Remove(_)) => Err(KvStoreError::DecodeError(
+                    "Found remove, when expected set".to_string(),
+                )),
+                Err(decode::Error::InvalidMarkerRead(err)) => Err(KvStoreError::IOError(err)),
+                Err(err) => return Err(KvStoreError::DecodeError(err.to_string())),
+            }
+        } else {
+            Ok(None)
+        }
     }
 
     /// Remove a given key. Return an error if the key does not exist or is not removed successfully.
@@ -157,7 +180,7 @@ impl KvStore {
         It then appends the serialized command to the log
         If that succeeds, it exits silently with error code 0
         */
-        if let Some(_) = self.map.remove(&key) {
+        if let Some(_) = self.index.remove(&key) {
             let cmd = Command::Remove(key.clone());
             cmd.serialize(&mut Serializer::new(&mut self.writer))?;
             Ok(())
