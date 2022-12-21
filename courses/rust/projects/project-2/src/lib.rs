@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::convert::From;
 use std::convert::Into;
 use std::error::Error;
+use std::ffi::OsStr;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::fs;
@@ -18,6 +19,7 @@ use std::io::BufReader;
 use std::io::BufWriter;
 use std::io::Seek;
 use std::io::SeekFrom;
+use std::path::Path;
 use std::path::PathBuf;
 use std::result;
 
@@ -60,10 +62,19 @@ impl From<io::Error> for KvStoreError {
     }
 }
 
+struct CommandPosition {
+    log_number: u64,
+    offset: u64,
+    bytes: u64,
+}
+
 pub struct KvStore {
-    reader: BufReader<File>,
+    readers: HashMap<u64, BufReader<File>>,
     writer: BufWriter<File>,
-    index: HashMap<String, u64>,
+    index: HashMap<String, CommandPosition>,
+    log_number: u64,
+    path: PathBuf,
+    uncompacted_bytes: u64,
 }
 
 pub type Result<T> = result::Result<T, KvStoreError>;
@@ -74,94 +85,135 @@ enum Command {
     Remove(String),
 }
 
+fn log_path(path: &Path, log_number: u64) -> PathBuf {
+    let file_name = format!("{}.kvs.log", log_number);
+    path.join(file_name)
+}
+
+fn get_log_numbers(dir: &Path) -> io::Result<Vec<u64>> {
+    // Format of a log file name is <number>.kvs.log
+    let mut log_numbers: Vec<u64> = fs::read_dir(dir)?
+        .flat_map(|result| -> io::Result<PathBuf> { Ok::<PathBuf, io::Error>(result?.path()) })
+        .filter(|path| path.is_file() && path.extension() == Some("log".as_ref()))
+        .flat_map(|path| {
+            path.file_stem()
+                .and_then(OsStr::to_str)
+                .map(|stem| stem.trim_end_matches(".kvs"))
+                .map(|number| number.parse::<u64>())
+        })
+        .flatten()
+        .collect();
+    log_numbers.sort_unstable();
+    Ok(log_numbers)
+}
+
+fn load_index(
+    log_number: u64,
+    index: &mut HashMap<String, CommandPosition>,
+    reader: &mut BufReader<File>,
+) -> Result<()> {
+    let mut des = Deserializer::new(reader);
+    let mut offset = 0;
+    loop {
+        match Command::deserialize(&mut des) {
+            Ok(Command::Set(key, _)) => {
+                let bytes = des.get_mut().stream_position()? - offset;
+                index.insert(
+                    key,
+                    CommandPosition {
+                        log_number,
+                        offset,
+                        bytes,
+                    },
+                );
+            }
+            Ok(Command::Remove(key)) => {
+                index.remove(&key);
+            }
+            Err(decode::Error::InvalidMarkerRead(err)) => match err.kind() {
+                std::io::ErrorKind::UnexpectedEof => {
+                    break;
+                }
+                _ => return Err(KvStoreError::IOError(err)),
+            },
+            Err(err) => return Err(KvStoreError::DecodeError(err.to_string())),
+        }
+        offset = des.get_mut().stream_position()?;
+    }
+    Ok(())
+}
+
+const COMPACTION_THRESHOLD_BYTES: u64 = 1048576;
+
 impl KvStore {
     /// Open the KvStore at a given path. Return the KvStore.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
-        let mut path: PathBuf = path.into();
-        if !path.exists() {
-            fs::create_dir_all(&path)?;
-        }
-        path.push("kvs.log");
+        let path = path.into();
+        fs::create_dir_all(&path)?;
 
-        let mut wfile = File::options()
-            .write(true)
-            .append(true)
-            .create(true)
-            .open(&path)?;
-
-        let rfile = File::open(&path)?;
-        let mut reader = BufReader::new(rfile);
-        let mut des = Deserializer::new(&mut reader);
+        let log_numbers = get_log_numbers(&path)?;
         let mut index = HashMap::new();
-        let mut pos = 0;
-        loop {
-            match Command::deserialize(&mut des) {
-                Ok(Command::Set(key, _)) => {
-                    index.insert(key, pos);
-                }
-                Ok(Command::Remove(key)) => {
-                    index.remove(&key);
-                }
-                Err(decode::Error::InvalidMarkerRead(err)) => match err.kind() {
-                    std::io::ErrorKind::UnexpectedEof => {
-                        break;
-                    }
-                    _ => return Err(KvStoreError::IOError(err)),
-                },
-                Err(err) => return Err(KvStoreError::DecodeError(err.to_string())),
-            }
-            pos = des.get_mut().stream_position()?;
+        let mut readers = HashMap::new();
+
+        for &log_number in &log_numbers {
+            let rfile = File::open(log_path(&path, log_number))?;
+            let mut reader = BufReader::new(rfile);
+            load_index(log_number, &mut index, &mut reader)?;
+            readers.insert(log_number, reader);
         }
 
-        wfile.seek(SeekFrom::End(0))?;
-        let writer = BufWriter::new(wfile);
+        let &log_number = log_numbers.last().unwrap_or(&0);
+        let writer = new_log_file(&path, log_number, &mut readers)?;
+
         Ok(Self {
-            reader,
+            readers,
             writer,
             index,
+            log_number,
+            path,
+            uncompacted_bytes: 0,
         })
     }
 
     /// Set the value of a string key to a string. Return an error if the value is not written successfully.
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
-        /*
-        The user invokes kvs set mykey myvalue
-        kvs creates a value representing the "set" command, containing its key and value
-        It then serializes that command to a String
-        It then appends the serialized command to a file containing the log
-        If that succeeds, it exits silently with error code 0
-        If it fails, it exits by printing the error and returning a non-zero error code
-        */
-        let cmd = Command::Set(key.clone(), value.clone());
-        let pos = self.writer.stream_position()?;
+        let cmd = Command::Set(key.clone(), value);
+        let offset = self.writer.stream_position()?;
         cmd.serialize(&mut Serializer::new(&mut self.writer))?;
-        self.index.insert(key, pos);
+        let bytes = self.writer.stream_position()? - offset;
+        if let Some(cmd) = self.index.insert(
+            key,
+            CommandPosition {
+                log_number: self.log_number,
+                offset,
+                bytes,
+            },
+        ) {
+            self.uncompacted_bytes += cmd.bytes;
+        }
         self.writer.flush()?;
+
+        if self.uncompacted_bytes > COMPACTION_THRESHOLD_BYTES {
+            self.compact()?;
+        }
+
         Ok(())
     }
 
     /// Get the string value of a string key. If the key does not exist, return None. Return an error if the value is not read successfully.
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
-        /*
-        The user invokes kvs get mykey
-        kvs reads the entire log, one command at a time, recording the affected key and file offset of the command to an in-memory key -> log pointer map
-        It then checks the map for the log pointer
-        If it fails, it prints "Key not found", and exits with exit code 0
-        If it succeeds
-        It deserializes the command to get the last recorded value of the key
-        It prints the value to stdout and exits with exit code 0
-        */
         if let Some(pos) = self.index.get(&key) {
-            self.reader.seek(SeekFrom::Start(*pos))?;
+            let mut reader = self.readers.get_mut(&pos.log_number).unwrap();
+            reader.seek(SeekFrom::Start(pos.offset))?;
 
-            let mut des = Deserializer::new(&mut self.reader);
+            let mut des = Deserializer::new(&mut reader);
             match Command::deserialize(&mut des) {
                 Ok(Command::Set(_, value)) => Ok(Some(value)),
                 Ok(Command::Remove(_)) => Err(KvStoreError::DecodeError(
                     "Found remove, when expected set".to_string(),
                 )),
                 Err(decode::Error::InvalidMarkerRead(err)) => Err(KvStoreError::IOError(err)),
-                Err(err) => return Err(KvStoreError::DecodeError(err.to_string())),
+                Err(err) => Err(KvStoreError::DecodeError(err.to_string())),
             }
         } else {
             Ok(None)
@@ -170,22 +222,68 @@ impl KvStore {
 
     /// Remove a given key. Return an error if the key does not exist or is not removed successfully.
     pub fn remove(&mut self, key: String) -> Result<()> {
-        /*
-        The user invokes kvs rm mykey
-        Same as the "get" command, kvs reads the entire log to build the in-memory index
-        It then checks the map if the given key exists
-        If the key does not exist, it prints "Key not found", and exits with a non-zero error code
-        If it succeeds
-        It creates a value representing the "rm" command, containing its key
-        It then appends the serialized command to the log
-        If that succeeds, it exits silently with error code 0
-        */
-        if let Some(_) = self.index.remove(&key) {
+        if let Some(old_cmd) = self.index.remove(&key) {
             let cmd = Command::Remove(key.clone());
             cmd.serialize(&mut Serializer::new(&mut self.writer))?;
+            self.writer.flush()?;
+            self.uncompacted_bytes += old_cmd.bytes;
+            if self.uncompacted_bytes > COMPACTION_THRESHOLD_BYTES {
+                self.compact()?;
+            }
             Ok(())
         } else {
             Err(KvStoreError::KeyNotFound)
         }
     }
+
+    fn compact(&mut self) -> Result<()> {
+        self.log_number += 1;
+        self.writer = new_log_file(&self.path, self.log_number, &mut self.readers)?;
+
+        for command_pos in &mut self.index.values_mut() {
+            let reader = self.readers.get_mut(&command_pos.log_number).unwrap();
+            reader.seek(SeekFrom::Start(command_pos.offset))?;
+            let mut source = reader.take(command_pos.bytes);
+            command_pos.log_number = self.log_number;
+            command_pos.offset = self.writer.stream_position()?;
+            io::copy(&mut source, &mut self.writer)?;
+        }
+
+        let stale_log_numbers: Vec<u64> = self
+            .readers
+            .keys()
+            .filter(|&&log_number| log_number < self.log_number)
+            .cloned()
+            .collect();
+
+        for log_number in stale_log_numbers {
+            self.readers.remove(&log_number);
+            let log_path = log_path(&self.path, log_number);
+            fs::remove_file(log_path)?;
+        }
+
+        self.uncompacted_bytes = 0;
+
+        Ok(())
+    }
+}
+
+fn new_log_file(
+    path: &Path,
+    new_log_number: u64,
+    readers: &mut HashMap<u64, BufReader<File>>,
+) -> Result<BufWriter<File>> {
+    let log_path = log_path(path, new_log_number);
+
+    let mut wfile = File::options()
+        .create(true)
+        .write(true)
+        .append(true)
+        .open(&log_path)?;
+    wfile.seek(SeekFrom::End(0))?;
+    let writer = BufWriter::new(wfile);
+    let rfile = File::open(&log_path)?;
+    let reader = BufReader::new(rfile);
+    readers.insert(new_log_number, reader);
+    Ok(writer)
 }
