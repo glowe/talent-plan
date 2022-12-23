@@ -5,6 +5,7 @@ use kvs::KvStore;
 use kvs::KvsEngine;
 use kvs::KvsServer;
 use kvs::SledKvsEngine;
+use slog::error;
 use slog::info;
 use slog::o;
 use slog::Drain;
@@ -14,20 +15,49 @@ use slog_term::CompactFormat;
 use slog_term::TermDecorator;
 use std::env::current_dir;
 use std::error::Error;
+use std::fmt;
 use std::net::SocketAddr;
 use std::result::Result;
+use std::str::FromStr;
 
-#[derive(ValueEnum, Clone, Debug)]
+#[derive(ValueEnum, Clone, Debug, PartialEq)]
 enum EngineName {
     Kvs,
     Sled,
 }
 
-impl std::fmt::Display for EngineName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for EngineName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> fmt::Result {
         match &self {
             Self::Kvs => write!(f, "kvs"),
             Self::Sled => write!(f, "sled"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ParseEngineNameError(String);
+
+impl fmt::Display for ParseEngineNameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Unrecogized engine name: {}", self.0)
+    }
+}
+
+impl Error for ParseEngineNameError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        None
+    }
+}
+
+impl FromStr for EngineName {
+    type Err = ParseEngineNameError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        match input {
+            "kvs" => Ok(Self::Kvs),
+            "sled" => Ok(Self::Sled),
+            val => Err(ParseEngineNameError(val.to_string())),
         }
     }
 }
@@ -62,19 +92,37 @@ fn main() -> Result<(), Box<dyn Error>> {
         "engine" => cli.engine.to_string(), "ip-port" => cli.addr.to_string()
     );
 
+    let current_dir = current_dir()?;
+    let engine_file = current_dir.join("kvs.engine");
+
+    let last_engine = if !engine_file.exists() {
+        None
+    } else {
+        Some(std::fs::read_to_string(&engine_file)?.parse::<EngineName>()?)
+    };
+
+    if last_engine.is_some() && last_engine != Some(cli.engine.clone()) {
+        error!(
+            log,
+            "{} was chosen, but last engine was {}; quitting!",
+            last_engine.unwrap(),
+            cli.engine
+        );
+        log.fuse();
+        std::process::exit(1);
+    }
+
+    std::fs::write(&engine_file, format!("{}", cli.engine))?;
+
     match cli.engine {
         EngineName::Kvs => {
-            let dir = current_dir()?;
-            info!(log, "opening kvs logs"; "directory" => dir.to_str());
-            let engine = KvStore::open(dir)?;
+            info!(log, "kvs store"; "directory" => current_dir.to_str());
+            let engine = KvStore::open(current_dir)?;
             serve(engine, log, &cli.addr)?;
         }
         EngineName::Sled => {
-            serve(
-                SledKvsEngine::new(sled::open(current_dir()?)?),
-                log,
-                &cli.addr,
-            )?;
+            info!(log, "sled engine"; "directory" => current_dir.to_str());
+            serve(SledKvsEngine::new(sled::open(current_dir)?), log, &cli.addr)?;
         }
     };
     Ok(())
