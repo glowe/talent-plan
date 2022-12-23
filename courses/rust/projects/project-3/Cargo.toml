@@ -1,0 +1,33 @@
+[package]
+name = "kvs"
+version = "0.1.0"
+authors = ["Graham Lowe"]
+description = "A key-value store"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[bin]]
+name = "kvs-client"
+path = "src/bin/kvs_client.rs"
+
+[[bin]]
+name = "kvs-server"
+path = "src/bin/kvs_server.rs"
+
+[dependencies]
+clap = { version = "4.0.29", features = ["derive"] }
+rmp-serde = "1.1.1"
+serde = { version = "1.0.149", features = ["derive"] }
+sled = "0.34.7"
+slog = "2.7.0"
+slog-async = "2.7.0"
+slog-term = "2.9.0"
+
+[dev-dependencies]
+assert_cmd = "2.0.7"
+criterion = "0.4.0"
+predicates = "2.1.4"
+rand = "0.8.5"
+tempfile = "3.3.0"
+walkdir = "2.3.2"
