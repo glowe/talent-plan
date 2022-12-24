@@ -16,7 +16,7 @@ impl SledKvsEngine {
 
 impl KvsEngine for SledKvsEngine {
     fn set(&mut self, key: String, value: String) -> Result<()> {
-        self.db.insert(key, value.as_bytes())?;
+        self.db.insert(key, value.as_str())?;
         self.db.flush()?;
         Ok(())
     }
