@@ -21,7 +21,9 @@ fn write_benchmark(c: &mut Criterion) {
                 store
             },
             |mut store| {
-                for i in 0..100 {
+                let mut rng = SmallRng::from_seed([0; 32]);
+                for _ in 0..100 {
+                    let i = rng.gen_range(0..100000);
                     let key = format!("key{}", i);
                     let value = format!("value{}", i);
                     store.set(key, value).unwrap();
@@ -38,7 +40,9 @@ fn write_benchmark(c: &mut Criterion) {
                 engine
             },
             |mut engine| {
-                for i in 0..100 {
+                let mut rng = SmallRng::from_seed([0; 32]);
+                for _ in 0..100 {
+                    let i = rng.gen_range(0..100000);
                     let key = format!("key{}", i);
                     let value = format!("value{}", i);
                     engine.set(key, value).unwrap();
