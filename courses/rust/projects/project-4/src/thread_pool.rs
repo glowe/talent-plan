@@ -28,7 +28,7 @@ impl ThreadPool for NaiveThreadPool {
 pub struct SharedQueueThreadPool {}
 
 impl ThreadPool for SharedQueueThreadPool {
-    fn new(threads: u32) -> Result<Self> {
+    fn new(_threads: u32) -> Result<Self> {
         Ok(Self {})
     }
 

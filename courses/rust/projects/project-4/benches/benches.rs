@@ -20,7 +20,7 @@ fn write_benchmark(c: &mut Criterion) {
                 let store = KvStore::open(dir.into_path()).unwrap();
                 store
             },
-            |mut store| {
+            |store| {
                 let mut rng = SmallRng::from_seed([0; 32]);
                 for _ in 0..100 {
                     let i = rng.gen_range(0..100000);
@@ -39,7 +39,7 @@ fn write_benchmark(c: &mut Criterion) {
                 let engine = SledKvsEngine::new(sled::open(dir).unwrap());
                 engine
             },
-            |mut engine| {
+            |engine| {
                 let mut rng = SmallRng::from_seed([0; 32]);
                 for _ in 0..100 {
                     let i = rng.gen_range(0..100000);
@@ -56,7 +56,7 @@ fn write_benchmark(c: &mut Criterion) {
 fn read_benchmark(c: &mut Criterion) {
     c.bench_function("kvs_read", |b| {
         let dir = TempDir::new().unwrap();
-        let mut store = KvStore::open(dir.into_path()).unwrap();
+        let store = KvStore::open(dir.into_path()).unwrap();
         for i in 0..100 {
             let key = format!("key{}", i);
             let value = format!("value{}", i);
@@ -70,7 +70,7 @@ fn read_benchmark(c: &mut Criterion) {
     });
     c.bench_function("sled_read", |b| {
         let dir = TempDir::new().unwrap();
-        let mut engine = SledKvsEngine::new(sled::open(dir).unwrap());
+        let engine = SledKvsEngine::new(sled::open(dir).unwrap());
         for i in 0..100 {
             let key = format!("key{}", i);
             let value = format!("value{}", i);

@@ -16,6 +16,8 @@ use std::io::Seek;
 use std::io::SeekFrom;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use super::KvsEngine;
 
@@ -28,13 +30,14 @@ struct CommandPosition {
     bytes: u64,
 }
 
+#[derive(Clone)]
 pub struct KvStore {
-    readers: HashMap<u64, BufReader<File>>,
-    writer: BufWriter<File>,
-    index: HashMap<String, CommandPosition>,
-    log_number: u64,
+    readers: Arc<Mutex<HashMap<u64, BufReader<File>>>>,
+    writer: Arc<Mutex<BufWriter<File>>>,
+    index: Arc<Mutex<HashMap<String, CommandPosition>>>,
+    log_number: Arc<Mutex<u64>>,
     path: PathBuf,
-    uncompacted_bytes: u64,
+    uncompacted_bytes: Arc<Mutex<u64>>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -124,42 +127,48 @@ impl KvStore {
         let writer = new_log_file(&path, log_number, &mut readers)?;
 
         Ok(Self {
-            readers,
-            writer,
-            index,
-            log_number,
+            readers: Arc::new(Mutex::new(readers)),
+            writer: Arc::new(Mutex::new(writer)),
+            index: Arc::new(Mutex::new(index)),
+            log_number: Arc::new(Mutex::new(log_number)),
             path,
-            uncompacted_bytes: 0,
+            uncompacted_bytes: Arc::new(Mutex::new(0)),
         })
     }
 
-    fn compact(&mut self) -> Result<()> {
-        self.log_number += 1;
-        self.writer = new_log_file(&self.path, self.log_number, &mut self.readers)?;
+    fn compact(&self) -> Result<()> {
+        let mut log_number = self.log_number.lock().unwrap();
+        *log_number += 1;
+        let mut readers = self.readers.lock().unwrap();
+        let mut writer = self.writer.lock().unwrap();
 
-        for command_pos in &mut self.index.values_mut() {
-            let reader = self.readers.get_mut(&command_pos.log_number).unwrap();
+        *writer = new_log_file(&self.path, *log_number, &mut readers)?;
+        let mut index = self.index.lock().unwrap();
+
+        for command_pos in &mut index.values_mut() {
+            let reader = readers.get_mut(&command_pos.log_number).unwrap();
             reader.seek(SeekFrom::Start(command_pos.offset))?;
             let mut source = reader.take(command_pos.bytes);
-            command_pos.log_number = self.log_number;
-            command_pos.offset = self.writer.stream_position()?;
-            io::copy(&mut source, &mut self.writer)?;
+            command_pos.log_number = *log_number;
+            command_pos.offset = writer.stream_position()?;
+            let mut inner = writer.get_mut();
+            io::copy(&mut source, &mut inner)?;
         }
 
-        let stale_log_numbers: Vec<u64> = self
-            .readers
+        let stale_log_numbers: Vec<u64> = readers
             .keys()
-            .filter(|&&log_number| log_number < self.log_number)
+            .filter(|&&number| number < *log_number)
             .cloned()
             .collect();
 
         for log_number in stale_log_numbers {
-            self.readers.remove(&log_number);
+            readers.remove(&log_number);
             let log_path = log_path(&self.path, log_number);
             fs::remove_file(log_path)?;
         }
 
-        self.uncompacted_bytes = 0;
+        let mut uncompacted_bytes = self.uncompacted_bytes.lock().unwrap();
+        *uncompacted_bytes = 0;
 
         Ok(())
     }
@@ -167,24 +176,28 @@ impl KvStore {
 
 impl KvsEngine for KvStore {
     /// Set the value of a string key to a string. Return an error if the value is not written successfully.
-    fn set(&mut self, key: String, value: String) -> Result<()> {
+    fn set(&self, key: String, value: String) -> Result<()> {
         let cmd = Command::Set(key.clone(), value);
-        let offset = self.writer.stream_position()?;
-        cmd.serialize(&mut Serializer::new(&mut self.writer))?;
-        let bytes = self.writer.stream_position()? - offset;
-        if let Some(cmd) = self.index.insert(
+        let mut writer = self.writer.lock().unwrap();
+        let offset = writer.stream_position()?;
+        let mut inner = writer.get_mut();
+        cmd.serialize(&mut Serializer::new(&mut inner))?;
+        let bytes = writer.stream_position()? - offset;
+        let mut index = self.index.lock().unwrap();
+        let mut uncompacted_bytes = self.uncompacted_bytes.lock().unwrap();
+        if let Some(cmd) = index.insert(
             key,
             CommandPosition {
-                log_number: self.log_number,
+                log_number: *self.log_number.lock().unwrap(),
                 offset,
                 bytes,
             },
         ) {
-            self.uncompacted_bytes += cmd.bytes;
+            *uncompacted_bytes += cmd.bytes;
         }
-        self.writer.flush()?;
+        writer.flush()?;
 
-        if self.uncompacted_bytes > COMPACTION_THRESHOLD_BYTES {
+        if *uncompacted_bytes > COMPACTION_THRESHOLD_BYTES {
             self.compact()?;
         }
 
@@ -192,9 +205,11 @@ impl KvsEngine for KvStore {
     }
 
     /// Get the string value of a string key. If the key does not exist, return None. Return an error if the value is not read successfully.
-    fn get(&mut self, key: String) -> Result<Option<String>> {
-        if let Some(pos) = self.index.get(&key) {
-            let mut reader = self.readers.get_mut(&pos.log_number).unwrap();
+    fn get(&self, key: String) -> Result<Option<String>> {
+        let index = self.index.lock().unwrap();
+        if let Some(pos) = index.get(&key) {
+            let mut readers = self.readers.lock().unwrap();
+            let mut reader = readers.get_mut(&pos.log_number).unwrap();
             reader.seek(SeekFrom::Start(pos.offset))?;
 
             let mut des = Deserializer::new(&mut reader);
@@ -210,13 +225,17 @@ impl KvsEngine for KvStore {
     }
 
     /// Remove a given key. Return an error if the key does not exist or is not removed successfully.
-    fn remove(&mut self, key: String) -> Result<()> {
-        if let Some(old_cmd) = self.index.remove(&key) {
+    fn remove(&self, key: String) -> Result<()> {
+        let mut index = self.index.lock().unwrap();
+        if let Some(old_cmd) = index.remove(&key) {
             let cmd = Command::Remove(key.clone());
-            cmd.serialize(&mut Serializer::new(&mut self.writer))?;
-            self.writer.flush()?;
-            self.uncompacted_bytes += old_cmd.bytes;
-            if self.uncompacted_bytes > COMPACTION_THRESHOLD_BYTES {
+            let mut writer = self.writer.lock().unwrap();
+            let mut inner = writer.get_mut();
+            cmd.serialize(&mut Serializer::new(&mut inner))?;
+            writer.flush()?;
+            let mut uncompacted_bytes = self.uncompacted_bytes.lock().unwrap();
+            *uncompacted_bytes += old_cmd.bytes;
+            if *uncompacted_bytes > COMPACTION_THRESHOLD_BYTES {
                 self.compact()?;
             }
             Ok(())

@@ -4,6 +4,7 @@ use crate::error::KvsError;
 use crate::error::Result;
 use sled::Db;
 
+#[derive(Clone)]
 pub struct SledKvsEngine {
     db: Db,
 }
@@ -15,13 +16,13 @@ impl SledKvsEngine {
 }
 
 impl KvsEngine for SledKvsEngine {
-    fn set(&mut self, key: String, value: String) -> Result<()> {
+    fn set(&self, key: String, value: String) -> Result<()> {
         self.db.insert(key, value.as_str())?;
         self.db.flush()?;
         Ok(())
     }
 
-    fn get(&mut self, key: String) -> Result<Option<String>> {
+    fn get(&self, key: String) -> Result<Option<String>> {
         let value = self
             .db
             .get(key)?
@@ -31,7 +32,7 @@ impl KvsEngine for SledKvsEngine {
         Ok(value)
     }
 
-    fn remove(&mut self, key: String) -> Result<()> {
+    fn remove(&self, key: String) -> Result<()> {
         self.db.remove(key)?.ok_or(KvsError::KeyNotFound)?;
         self.db.flush()?;
         Ok(())
