@@ -1,11 +1,10 @@
+use rmp_serde::decode;
+use rmp_serde::encode;
 use std::error;
 use std::fmt;
 use std::io;
 use std::result;
 use std::string::FromUtf8Error;
-
-use rmp_serde::decode;
-use rmp_serde::encode;
 
 #[derive(Debug)]
 pub enum KvsError {
@@ -14,6 +13,7 @@ pub enum KvsError {
     IO(io::Error),
     KeyNotFound,
     UnexpectedCommand,
+    UnexpectedResponse,
     StringError(String),
     Sled(sled::Error),
     Utf8(FromUtf8Error),
@@ -27,6 +27,7 @@ impl fmt::Display for KvsError {
             Self::IO(err) => write!(f, "IO: {}", err),
             Self::KeyNotFound => write!(f, "Key not found"),
             Self::UnexpectedCommand => write!(f, "UnexpectedCommand"),
+            Self::UnexpectedResponse => write!(f, "UnexpectedResponse"),
             Self::StringError(msg) => write!(f, "{}", msg),
             Self::Sled(err) => write!(f, "Sled: {}", err),
             Self::Utf8(err) => write!(f, "Utf8: {}", err),
@@ -42,6 +43,7 @@ impl error::Error for KvsError {
             Self::IO(source) => Some(source),
             Self::KeyNotFound => None,
             Self::UnexpectedCommand => None,
+            Self::UnexpectedResponse => None,
             Self::StringError(_) => None,
             Self::Sled(source) => Some(source),
             Self::Utf8(source) => Some(source),

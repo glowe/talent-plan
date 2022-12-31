@@ -1,3 +1,6 @@
+use super::KvsEngine;
+use crate::KvsError;
+use crate::Result;
 use rmp_serde::decode;
 use rmp_serde::Deserializer;
 use rmp_serde::Serializer;
@@ -18,11 +21,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-
-use super::KvsEngine;
-
-use crate::KvsError;
-use crate::Result;
 
 struct CommandPosition {
     log_number: u64,

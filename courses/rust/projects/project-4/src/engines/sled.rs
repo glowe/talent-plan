@@ -1,7 +1,6 @@
-use crate::KvsEngine;
-
 use crate::error::KvsError;
 use crate::error::Result;
+use crate::KvsEngine;
 use sled::Db;
 
 #[derive(Clone)]

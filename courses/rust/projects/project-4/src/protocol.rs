@@ -9,19 +9,9 @@ pub enum Request {
 }
 
 #[derive(Deserialize, Serialize, Debug)]
-pub enum GetResponse {
-    Ok(Option<String>),
-    Err(String),
-}
-
-#[derive(Deserialize, Serialize, Debug)]
-pub enum SetResponse {
-    Ok(()),
-    Err(String),
-}
-
-#[derive(Deserialize, Serialize, Debug)]
-pub enum RemoveResponse {
-    Ok(()),
+pub enum Response {
+    GetOk(Option<String>),
+    SetOk(()),
+    RemoveOk(()),
     Err(String),
 }
