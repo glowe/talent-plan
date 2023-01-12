@@ -9,6 +9,7 @@ use rmp_serde::Serializer;
 use serde::Deserialize;
 use serde::Serialize;
 use slog::debug;
+use slog::error;
 use slog::Logger;
 use std::io::BufReader;
 use std::io::BufWriter;
@@ -31,19 +32,26 @@ impl<E: KvsEngine> KvsServer<E> {
         let listener = TcpListener::bind(addr)?;
         let thread_pool = NaiveThreadPool::new(32)?;
         for result in listener.incoming() {
-            let mut stream = result?;
+            let stream = result?;
             let engine = self.engine.clone();
             let log = self.log.clone();
             thread_pool.spawn(move || {
-                let request = read_request(&mut stream).unwrap();
-                debug!(&log, "request = {:?}", request);
-                let mut response = process_request(&engine, request);
-                debug!(&log, "response = {:?}", response);
-                respond(stream, &mut response).unwrap();
-            });
+                if let Err(err) = serve(&log, engine, stream) {
+                    error!(&log, "failed with error {}", err.to_string())
+                }
+            })
         }
         Ok(())
     }
+}
+
+fn serve<E: KvsEngine>(log: &Logger, engine: E, mut stream: TcpStream) -> Result<()> {
+    let request = read_request(&mut stream)?;
+    debug!(&log, "request = {:?}", request);
+    let mut response = process_request(&engine, request);
+    debug!(&log, "response = {:?}", response);
+    respond(stream, &mut response)?;
+    Ok(())
 }
 
 fn read_request(stream: &mut TcpStream) -> Result<Request> {

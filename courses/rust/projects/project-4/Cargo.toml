@@ -21,6 +21,8 @@ harness = false
 
 [dependencies]
 clap = { version = "4.0.29", features = ["derive"] }
+crossbeam = "0.8.2"
+rayon = "1.6.1"
 rmp-serde = "1.1.1"
 serde = { version = "1.0.149", features = ["derive"] }
 sled = "0.34.7"

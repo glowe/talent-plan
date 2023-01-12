@@ -17,4 +17,4 @@ mod shared_queue;
 pub use shared_queue::SharedQueueThreadPool;
 
 mod rayon;
-pub use rayon::RayonThreadPool;
+pub use self::rayon::RayonThreadPool;
